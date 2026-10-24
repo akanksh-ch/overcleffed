@@ -96,7 +96,9 @@ class MacroActions:
             g, c = self.best_goal(sub, state, i)
             if g is not None:
                 out[sub] = c
-        return out
+        # harder mask: wait / place_on_counter only when nothing else is feasible
+        core = {k: v for k, v in out.items() if k not in ("wait", "place_on_counter")}
+        return core or out
 
     # ---- execution ----
     def assign(self, i, sub, state):
