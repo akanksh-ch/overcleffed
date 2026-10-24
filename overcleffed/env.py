@@ -104,3 +104,34 @@ def build_state_payload(layout, ser_state, history, score, horizon):
         "now": {**ser_state, "score": score, "steps_left": horizon - ser_state["t"]},
         "recent_history_oldest_first": history.render(),
     }
+
+
+def _pot_line(mdp, state):
+    out = []
+    for pos in mdp.get_pot_locations():
+        o = state.objects.get(pos)
+        if o is None:
+            s = "empty"
+        elif o.is_ready:
+            s = "READY"
+        elif o.is_cooking:
+            s = f"cooking {max(0, o.cook_time - o._cooking_tick)} ticks left"
+        else:
+            s = f"{len(o.ingredients)}/3 onions"
+        out.append(f"pot{pos[0]}{pos[1]}: {s}")
+    return "; ".join(out)
+
+
+def compact_prompt(mdp, state, score, horizon, plans, hist):
+    """Short plain-text state for macro mode. `plans[i]` = (subgoal, steps_left) or None.
+    `hist[i]` = list of recent subgoal names."""
+    lines = [f"t={state.timestep}/{horizon} score={score}", _pot_line(mdp, state)]
+    for i, p in enumerate(state.players):
+        h = p.held_object.name if p.held_object else "nothing"
+        pl = plans[i]
+        doing = f", doing {pl[0]}" if pl else ""
+        lines.append(f"chef{i} at {p.position[0]},{p.position[1]} holds {h}{doing}")
+    for i, h in enumerate(hist):
+        if h:
+            lines.append(f"chef{i} recent: {','.join(h)}")
+    return "\n".join(lines)
