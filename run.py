@@ -27,6 +27,7 @@ def run_episode(ep, args, policy, log, pool):
     hist = History(max(args.history_k, 1))
     state, score, soups, lats, late = env.state, 0, 0, [], 0
     calls, toks, confs, call_lats = 0, [], [], []
+    ag, cag, cdis = [], [], []
     ser = serialize_state(state)
     hist.push(ser)
     done, tick = False, args.tick_hz and 1.0 / args.tick_hz
@@ -55,6 +56,11 @@ def run_episode(ep, args, policy, log, pool):
                               "late": timed_out, "err": err, **info}) + "\n")
         log.flush()
         if info.get("clef_called"):
+            for a_, c_ in zip(info.get("agree") or [], info.get("conf_by_chef") or []):
+                if a_ is not None:
+                    ag.append(a_)
+                    if c_ is not None:
+                        (cag if a_ else cdis).append(c_)
             calls += 1
             call_lats.append(lat)
             if info.get("input_tokens"):
@@ -73,6 +79,9 @@ def run_episode(ep, args, policy, log, pool):
             "mean_latency_s": statistics.mean(lats), "p95_latency_s": pct(lats, 0.95),
             "n_clef_calls": calls, "mean_input_tokens": statistics.mean(toks) if toks else None,
             "mean_confidence": statistics.mean(confs) if confs else None,
+            "agreement_rate": statistics.mean(ag) if ag else None, "n_agree_compared": len(ag),
+            "conf_when_agree": statistics.mean(cag) if cag else None,
+            "conf_when_disagree": statistics.mean(cdis) if cdis else None,
             "mean_call_latency_s": statistics.mean(call_lats) if call_lats else None}
 
 
@@ -81,6 +90,8 @@ def main():
     ap.add_argument("--layout", default="cramped_room")
     ap.add_argument("--horizon", type=int, default=400)
     ap.add_argument("--history-k", type=int, default=None, help="raw: 5 states; macro: 2 subgoals")
+    ap.add_argument("--question-mode", choices=["choice", "noul"], default="choice")
+    ap.add_argument("--roles", action="store_true", help="state chef roles in prompt (macro)")
     ap.add_argument("--actions", choices=["raw", "macro"], default="raw")
     ap.add_argument("--decode", choices=["argmax", "sample"], default="argmax")
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -97,8 +108,8 @@ def main():
     if args.history_k is None:
         args.history_k = 2 if args.actions == "macro" else 5
     if args.actions == "macro" and args.backend != "greedy":
-        policy = MacroPolicy(clef_chooser(args.url, args.decode, args.temperature) if args.backend == "clef"
-                             else mock_chooser(args.seed), args.history_k)
+        policy = MacroPolicy(clef_chooser(args.url, args.decode, args.temperature, question_mode=args.question_mode) if args.backend == "clef"
+                             else mock_chooser(args.seed), args.history_k, args.roles)
     else:
       policy = {"clef": lambda: ClefPolicy(args.url, args.decode, args.temperature),
               "mock": lambda: MockPolicy(args.seed), "greedy": GreedyPolicy}[args.backend]()

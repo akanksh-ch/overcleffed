@@ -150,9 +150,9 @@ class GreedyPolicy(Policy):
 class MacroPolicy(Policy):
     """Chefs follow subgoal plans; the chooser (Clef or mock) is queried only when a chef needs one.
     act() returns raw action names, so runner/replay stay unchanged."""
-    def __init__(self, chooser, history_k=2):
+    def __init__(self, chooser, history_k=2, roles=False):
         super().__init__(RawActions())
-        self.chooser, self.k = chooser, history_k
+        self.chooser, self.k, self.roles = chooser, history_k, roles
         self.macro_space = None
 
     @property
@@ -178,14 +178,23 @@ class MacroPolicy(Policy):
             opts = {i: ms.options_for(state, i) for i in asked}
             keep = [(ms.plans[j]["sub"], 0) if ms.plans[j] else None for j in (0, 1)]
             prompt = compact_prompt(self.env.mdp, state, payload.get("score", 0), self.horizon, keep,
-                                    [h[-self.k:] if self.k else [] for h in self.hist])
-            choice, probs, meta = self.chooser(prompt, opts, state)
+                                    [h[-self.k:] if self.k else [] for h in self.hist], self.roles)
+            forced = {i: next(iter(o)) for i, o in opts.items() if len(o) == 1}  # nothing to choose
+            ask = {i: o for i, o in opts.items() if i not in forced}
+            choice, probs, meta = dict(forced), {}, {}
+            if ask:
+                c, probs, meta = self.chooser(prompt, ask, state)
+                choice.update(c)
+            hc = [heuristic_choice(ask[i], i) if i in ask else None for i in (0, 1)]
+            info["heuristic_choice"] = hc
+            info["agree"] = [choice[i] == hc[i] if i in ask else None for i in (0, 1)]
+            info["conf_by_chef"] = [(meta.get("conf_by_chef") or {}).get(i) for i in (0, 1)]
             for i in asked:
                 ms.assign(i, choice[i], state)
                 self.hist[i].append(choice[i])
                 self.hist[i] = self.hist[i][-max(self.k, 1):]
                 info["subgoal_probs"][i] = probs.get(i) if probs else None
-            info["clef_called"] = meta.get("called", False)
+            info["clef_called"] = bool(ask) and meta.get("called", False)
             info["input_tokens"] = meta.get("input_tokens")
             info["confidence"] = meta.get("confidence")
         info["subgoal"] = [ms.plans[i]["sub"] for i in (0, 1)]
@@ -198,28 +207,36 @@ class MacroPolicy(Policy):
         return names, None, info
 
 
+def heuristic_choice(opts, i):
+    """Rule-based reference choice (chef 0 favours onions, chef 1 dishes)."""
+    order = ["start_cooking", "deliver_soup", "pickup_soup", "put_onion_in_pot",
+             "get_onion", "get_dish"] if i == 0 else \
+            ["start_cooking", "deliver_soup", "pickup_soup", "put_onion_in_pot", "get_dish", "get_onion"]
+    return next((n for n in order if n in opts), next(iter(opts)))
+
+
 def mock_chooser(seed=0, heuristic=True):
     rng = random.Random(seed)
     def choose(prompt, opts, state):
         meta = {"called": True}
         if not heuristic:
             return {i: rng.choice(list(o)) for i, o in opts.items()}, None, meta
-        out = {}
-        for i, o in opts.items():  # chef 0 favours onions, chef 1 dishes
-            order = ["start_cooking", "deliver_soup", "pickup_soup", "put_onion_in_pot",
-                     "get_onion", "get_dish"] if i == 0 else \
-                    ["start_cooking", "deliver_soup", "pickup_soup", "put_onion_in_pot", "get_dish", "get_onion"]
-            out[i] = next((n for n in order if n in o), "wait")
-        return out, None, meta
+        return {i: heuristic_choice(o, i) for i, o in opts.items()}, None, meta
     return choose
 
 
-def clef_chooser(url, decode_mode="argmax", temperature=1.0, timeout=120, log=sys.stderr):
+def clef_chooser(url, decode_mode="argmax", temperature=1.0, timeout=120, log=sys.stderr,
+                 question_mode="choice"):
     sess, seen = requests.Session(), [False]
     from overcleffed.macro import SUBGOALS, WAIT_TICKS
     def choose(prompt, opts, state):
         qs = {}
-        for i, o in opts.items():
+        if question_mode == "noul":
+            for i, o in opts.items():
+                for n, c in o.items():
+                    qs[f"chef_{i}_{n}"] = {"type": "noul", "instructions":
+                        f"Chef {i}: does {n} ({SUBGOALS[n]}; {c} steps) move the team closest to delivering soup right now?"}
+        for i, o in ({} if question_mode == "noul" else opts).items():
             qs[f"chef_{i}_subgoal"] = {
                 "type": "choice",
                 "instructions": (f"Pick chef {i}'s next subgoal. Goal: serve many soups "
@@ -235,7 +252,17 @@ def clef_chooser(url, decode_mode="argmax", temperature=1.0, timeout=120, log=sy
             print("RAW CLEF RESPONSE:", json.dumps(raw)[:2000], file=log)
         answers = raw.get("response", raw).get("answers", raw.get("answers", {}))
         usage = raw.get("usage") or raw.get("response", {}).get("usage") or {}
-        choice, probs, confs = {}, {}, []
+        choice, probs, confs, cbc = {}, {}, [], {}
+        if question_mode == "noul":
+            for i, o in opts.items():
+                v = {n: float((answers.get(f"chef_{i}_{n}") or {}).get("noul", 0.0)) for n in o}
+                s = sum(v.values()) or 1.0
+                probs[i] = v  # raw noul scores per subgoal
+                choice[i] = decode({n: x / s for n, x in v.items()}, decode_mode, temperature)
+                confs.append(v[choice[i]])
+                cbc[i] = v[choice[i]]
+            return choice, probs, {"called": True, "input_tokens": usage.get("input_tokens"),
+                                   "confidence": sum(confs) / len(confs), "conf_by_chef": cbc}
         for i, o in opts.items():
             a = answers.get(f"chef_{i}_subgoal")
             p = parse_choice(a, list(o)) or {n: float(n == "wait") for n in o}
@@ -243,6 +270,7 @@ def clef_chooser(url, decode_mode="argmax", temperature=1.0, timeout=120, log=sy
             choice[i] = decode(p, decode_mode, temperature)
             if isinstance(a, dict) and "confidence" in a:
                 confs.append(a["confidence"])
+                cbc[i] = a["confidence"]
         return choice, probs, {"called": True, "input_tokens": usage.get("input_tokens"),
-                               "confidence": sum(confs) / len(confs) if confs else None}
+                               "confidence": sum(confs) / len(confs) if confs else None, "conf_by_chef": cbc}
     return choose

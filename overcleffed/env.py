@@ -116,13 +116,22 @@ def _pot_line(mdp, state):
             s = "READY"
         elif o.is_cooking:
             s = f"cooking {max(0, o.cook_time - o._cooking_tick)} ticks left"
+        elif len(o.ingredients) >= 3:
+            s = "3/3 onions, not cooking -> needs start_cooking"
         else:
-            s = f"{len(o.ingredients)}/3 onions"
+            n = len(o.ingredients)
+            s = f"{n}/3 onions -> needs {3 - n} onion"
+        if o is not None and o.is_ready:
+            s = "soup READY -> needs dish + pickup_soup"
         out.append(f"pot{pos[0]}{pos[1]}: {s}")
     return "; ".join(out)
 
 
-def compact_prompt(mdp, state, score, horizon, plans, hist):
+ROLES = {0: "role: onions + cooking (get_onion, put_onion_in_pot, start_cooking)",
+         1: "role: dishes + serving (get_dish, pickup_soup, deliver_soup)"}
+
+
+def compact_prompt(mdp, state, score, horizon, plans, hist, roles=False):
     """Short plain-text state for macro mode. `plans[i]` = (subgoal, steps_left) or None.
     `hist[i]` = list of recent subgoal names."""
     lines = [f"t={state.timestep}/{horizon} score={score}", _pot_line(mdp, state)]
@@ -130,7 +139,9 @@ def compact_prompt(mdp, state, score, horizon, plans, hist):
         h = p.held_object.name if p.held_object else "nothing"
         pl = plans[i]
         doing = f", doing {pl[0]}" if pl else ""
-        lines.append(f"chef{i} at {p.position[0]},{p.position[1]} holds {h}{doing}")
+        hint = " -> deliver_soup" if h == "soup" else ""
+        role = f" [{ROLES[i]}]" if roles else ""
+        lines.append(f"chef{i} at {p.position[0]},{p.position[1]} holds {h}{hint}{doing}{role}")
     for i, h in enumerate(hist):
         if h:
             lines.append(f"chef{i} recent: {','.join(h)}")
