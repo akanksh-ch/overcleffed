@@ -128,7 +128,7 @@ class MockPolicy(Policy):
         names = list(self.space.options)
         w = [3, 3, 3, 3, 1, 3]
         out = [self.rng.choices(names, weights=w)[0] for _ in (0, 1)]
-        return out, None, {}
+        return out, None, meta
 
 
 class GreedyPolicy(Policy):
@@ -144,3 +144,105 @@ class GreedyPolicy(Policy):
         acts = [a.action(state)[0] for a in self.agents]
         inv = {v: k for k, v in RawActions._map.items()}
         return [inv[a] for a in acts], None, {}
+
+
+# ---- Macro-action (subgoal) policies ----
+class MacroPolicy(Policy):
+    """Chefs follow subgoal plans; the chooser (Clef or mock) is queried only when a chef needs one.
+    act() returns raw action names, so runner/replay stay unchanged."""
+    def __init__(self, chooser, history_k=2):
+        super().__init__(RawActions())
+        self.chooser, self.k = chooser, history_k
+        self.macro_space = None
+
+    @property
+    def options(self):
+        from overcleffed.macro import SUBGOALS
+        return SUBGOALS
+
+    def reset(self, env):
+        from overcleffed.macro import MacroActions
+        self.env = env
+        self.ms = MacroActions(env)
+        self.ms.reset()
+        self.hist = [[], []]
+        self.score = 0
+        self.horizon = env.horizon
+
+    def act(self, payload, state):
+        from overcleffed.env import compact_prompt
+        ms = self.ms
+        asked = [i for i in (0, 1) if ms.needs_subgoal(state, i)]
+        info = {"clef_called": False, "subgoal_probs": [None, None], "input_tokens": None, "confidence": None}
+        if asked:
+            opts = {i: ms.options_for(state, i) for i in asked}
+            keep = [(ms.plans[j]["sub"], 0) if ms.plans[j] else None for j in (0, 1)]
+            prompt = compact_prompt(self.env.mdp, state, payload.get("score", 0), self.horizon, keep,
+                                    [h[-self.k:] if self.k else [] for h in self.hist])
+            choice, probs, meta = self.chooser(prompt, opts, state)
+            for i in asked:
+                ms.assign(i, choice[i], state)
+                self.hist[i].append(choice[i])
+                self.hist[i] = self.hist[i][-max(self.k, 1):]
+                info["subgoal_probs"][i] = probs.get(i) if probs else None
+            info["clef_called"] = meta.get("called", False)
+            info["input_tokens"] = meta.get("input_tokens")
+            info["confidence"] = meta.get("confidence")
+        info["subgoal"] = [ms.plans[i]["sub"] for i in (0, 1)]
+        info["asked"] = asked
+        inv = {v: k for k, v in RawActions._map.items()}
+        names = []
+        for i in (0, 1):
+            a = ms.step_action(state, i)
+            names.append(inv[a])
+        return names, None, info
+
+
+def mock_chooser(seed=0, heuristic=True):
+    rng = random.Random(seed)
+    def choose(prompt, opts, state):
+        meta = {"called": True}
+        if not heuristic:
+            return {i: rng.choice(list(o)) for i, o in opts.items()}, None, meta
+        out = {}
+        for i, o in opts.items():  # chef 0 favours onions, chef 1 dishes
+            order = ["start_cooking", "deliver_soup", "pickup_soup", "put_onion_in_pot",
+                     "get_onion", "get_dish"] if i == 0 else \
+                    ["start_cooking", "deliver_soup", "pickup_soup", "put_onion_in_pot", "get_dish", "get_onion"]
+            out[i] = next((n for n in order if n in o), "wait")
+        return out, None, meta
+    return choose
+
+
+def clef_chooser(url, decode_mode="argmax", temperature=1.0, timeout=120, log=sys.stderr):
+    sess, seen = requests.Session(), [False]
+    from overcleffed.macro import SUBGOALS, WAIT_TICKS
+    def choose(prompt, opts, state):
+        qs = {}
+        for i, o in opts.items():
+            qs[f"chef_{i}_subgoal"] = {
+                "type": "choice",
+                "instructions": (f"Pick chef {i}'s next subgoal. Goal: serve many soups "
+                                 "(3 onions in pot, cook, dish, soup, serve). Keep both chefs busy, avoid blocking."),
+                "criteria": {n: (f"{SUBGOALS[n]} ({c} steps)" if n != "wait" else f"idle {WAIT_TICKS} ticks")
+                             for n, c in o.items()}}
+        r = sess.post(f"{url}/v1/systemone", json={"model": "clef-flash", "state": prompt, "questions": qs},
+                      timeout=timeout)
+        r.raise_for_status()
+        raw = r.json()
+        if not seen[0]:
+            seen[0] = True
+            print("RAW CLEF RESPONSE:", json.dumps(raw)[:2000], file=log)
+        answers = raw.get("response", raw).get("answers", raw.get("answers", {}))
+        usage = raw.get("usage") or raw.get("response", {}).get("usage") or {}
+        choice, probs, confs = {}, {}, []
+        for i, o in opts.items():
+            a = answers.get(f"chef_{i}_subgoal")
+            p = parse_choice(a, list(o)) or {n: float(n == "wait") for n in o}
+            probs[i] = p
+            choice[i] = decode(p, decode_mode, temperature)
+            if isinstance(a, dict) and "confidence" in a:
+                confs.append(a["confidence"])
+        return choice, probs, {"called": True, "input_tokens": usage.get("input_tokens"),
+                               "confidence": sum(confs) / len(confs) if confs else None}
+    return choose
