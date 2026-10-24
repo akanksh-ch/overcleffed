@@ -24,7 +24,7 @@ def run_episode(ep, args, policy, log, pool):
     space = policy.space
     macro = args.actions == "macro"
     layout = layout_summary(env.mdp)
-    hist = History(args.history_k)
+    hist = History(max(args.history_k, 1))
     state, score, soups, lats, late = env.state, 0, 0, [], 0
     calls, toks, confs, call_lats = 0, [], [], []
     ser = serialize_state(state)
