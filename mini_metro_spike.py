@@ -388,6 +388,8 @@ class Recording:
     def __call__(self, adapter, events):
         import pygame
         from PIL import Image, ImageDraw
+        from config import screen_color
+        self.surface.fill(screen_color)
         self.renderer.draw(self.surface, adapter.mediator, alpha=1.0)
         image = Image.frombytes('RGB', self.surface.get_size(), pygame.image.tobytes(self.surface, 'RGB'))
         image = image.resize((768, 432))

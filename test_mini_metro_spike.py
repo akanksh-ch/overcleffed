@@ -18,7 +18,7 @@ try:
 except ModuleNotFoundError as error:
     raise unittest.SkipTest(f"isolated simulator dependencies unavailable: {error}") from error
 
-from mini_metro_spike import Adapter, Decisions, heuristic, run_episode, parse_choice
+from mini_metro_spike import Adapter, Decisions, Recording, heuristic, run_episode, parse_choice
 
 
 class SpikeTests(unittest.TestCase):
@@ -67,6 +67,14 @@ class SpikeTests(unittest.TestCase):
             adapter.tick(adapter.snapshot()['menu']['assign locomotive L0'])
             _, _, _, info = adapter.tick(adapter.snapshot()['menu'][name])
             self.assertTrue(info['action_ok'], name)
+
+    def test_recording_clears_background_before_each_frame(self):
+        recording = Recording('test')
+        recording(self.adapter, [])
+        self.assertEqual(recording.frames[-1].convert('RGB').getpixel((5, 200)), (247, 245, 239))
+        recording.surface.fill((255, 0, 0))
+        recording(self.adapter, [])
+        self.assertEqual(recording.frames[-1].convert('RGB').getpixel((5, 200)), (247, 245, 239))
 
     def test_reset_prevents_old_adapter_from_touching_new_episode(self):
         self.env.reset(seed=42)
