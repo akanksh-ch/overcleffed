@@ -111,3 +111,11 @@ Decision sequences (24 opportunities each):
 - Visual artifact checked by eye: Clef final frame shows a single orange line with carriages and one off-view/unconnected station state is not verified from the image; trust telemetry/events JSON over the GIF for metrics.
 
 Next options (not run, need approval): 3-5 more seeds each, latency-matched heuristic control, a tighter demand/longer cap so congestion actually bites, or stop and keep the kitchen demo as primary.
+
+## Seed sweep at default demand (spawn interval 900 steps, 120 s cap)
+
+- Heuristic: seeds 1-8, 0 game-overs, 28.0 deliveries mean (14.0/min), mean waiting 1.95, peak oldest wait 21.2 s.
+- Clef (choice menu): seeds 1-5 complete, 2 game-overs (seeds 3 and 4), 22.0 deliveries mean (12.0/min), mean waiting 3.47, peak oldest wait 40.4 s; latency median 0.89 s, max 1.81 s, no errors.
+- Paired on seeds 1-5: Clef never beat the heuristic on survival (0 wins, 3 ties, 2 losses; mean -14.4 s) or deliveries (0 wins, 2 ties, 3 losses; mean -6.8).
+- Clef seeds 6-8 are incomplete (sweep killed for time); not rerun, excluded. Discarded: first Clef pass with 6 parallel runs had 21 `TimeoutError` on the 2.5 s socket timeout (shared endpoint load), moved to `runs/mini_metro_sweep/spawn900/_clef_parallel6_timeouts/`.
+- Stress levels beyond default spawn (denser demand) were not run. Game-overs came from Clef connecting stations late and churning fleet, per event logs; not isolated experimentally. n=5, one run each, no significance claim.
