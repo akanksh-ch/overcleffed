@@ -24,6 +24,7 @@ UPSTREAM_COMMIT = 'ef1be2dfdc6e1dadafa9bf2c41d1ce5f081adc4d'
 TICK_MS = 16
 DECISION_MS = 5000
 DEADLINE_S = 3.0
+FPS = 30
 
 
 class Adapter:
@@ -460,7 +461,7 @@ def run_episode(adapter, choose, *, sim_cap_ms=120000, wall_cap_s=150, max_calls
             next_sample += 1000
         if record is not None and adapter.mediator.time_ms >= next_frame:
             record(adapter, decisions.events)
-            next_frame += 500
+            next_frame += 1000 / FPS
     # Do not wait on inference or mutate a finished episode. The worker has no
     # environment reference; any result arriving after this point is discarded.
     if decisions.pending is not None:
@@ -512,36 +513,47 @@ def quality(summary, telemetry):
 
 
 class Recording:
-    """Small, privileged-state GIF, not a pixel-input policy recording."""
+    """Privileged-state video (not pixel-input policy play): 960x540 raw RGB piped to ffmpeg."""
+    SIZE = (960, 540)
 
-    def __init__(self, label):
+    def __init__(self, label, path=None):
         import pygame
         from rendering.game_renderer import GameRenderer
-        self.label = label
+        self.label, self.path = label, path
         self.renderer = GameRenderer()
         self.surface = pygame.Surface((1920, 1080))
-        self.frames = []
+        self.last = pygame.Surface(self.SIZE)
+        self.frames = 0
+        self.ffmpeg = path and subprocess.Popen(
+            ['/usr/bin/ffmpeg', '-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', '960x540',
+             '-r', str(FPS), '-i', '-', '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+             '-r', str(FPS), str(path)], stdin=subprocess.PIPE)
 
     def __call__(self, adapter, events):
         import pygame
-        from PIL import Image, ImageDraw
         from config import screen_color
         self.surface.fill(screen_color)
         self.renderer.draw(self.surface, adapter.mediator, alpha=1.0)
-        image = Image.frombytes('RGB', self.surface.get_size(), pygame.image.tobytes(self.surface, 'RGB'))
-        image = image.resize((768, 432))
-        draw = ImageDraw.Draw(image)
+        pygame.transform.smoothscale(self.surface, self.SIZE, self.last)
         row = metrics(adapter)
         status = next((e.get('choice', e['status']) for e in reversed(events)
                        if e['status'] != 'requested'), 'waiting')
-        draw.rectangle((0, 0, 768, 46), fill='white')
-        draw.text((8, 4), f"{self.label} | ASSISTED STRUCTURED CONTROL | {row['sim_ms']/1000:.1f}s | delivered {row['deliveries']} | waiting {row['waiting']}", fill='black')
-        draw.text((8, 25), str(status)[:100], fill='black')
-        self.frames.append(image.quantize(colors=128))
+        pygame.draw.rect(self.last, 'white', (0, 0, self.SIZE[0], 48))
+        font = self.renderer.resources.font(None, 24)
+        for y, text in ((4, f"{self.label} | ASSISTED STRUCTURED CONTROL | {row['sim_ms']/1000:.1f}s | "
+                            f"delivered {row['deliveries']} | waiting {row['waiting']}"), (26, str(status)[:100])):
+            self.last.blit(font.render(text, True, 'black'), (8, y))
+        self.frames += 1
+        if self.ffmpeg:
+            self.ffmpeg.stdin.write(pygame.image.tobytes(self.last, 'RGB'))
 
-    def save(self, path):
-        self.frames[0].save(path, save_all=True, append_images=self.frames[1:], duration=500, loop=0)
-        self.frames[-1].save(path.with_suffix('.png'))
+    def close(self):
+        import pygame
+        if self.ffmpeg:
+            self.ffmpeg.stdin.close()
+            if self.ffmpeg.wait(timeout=60):
+                raise RuntimeError('ffmpeg failed')
+            pygame.image.save(self.last, str(Path(self.path).with_suffix('.png')))
 
 
 def summarize(root):
@@ -587,7 +599,7 @@ def main():
     parser.add_argument('--seed', type=int)
     parser.add_argument('--spawn-steps', type=int, default=900)
     parser.add_argument('--sim-cap-s', type=int, default=120)
-    parser.add_argument('--gif', action='store_true')
+    parser.add_argument('--video', action='store_true', help='write <run>.mp4 (30 fps) and final .png')
     args = parser.parse_args()
     if args.summarize:
         return summarize(args.output)
@@ -605,7 +617,7 @@ def main():
     target = out / f'{args.policy}-seed{args.seed}.json'
     if target.exists():
         parser.error(f'{target} exists')
-    recording = Recording(args.policy) if args.gif else None
+    recording = Recording(args.policy, target.with_suffix('.mp4')) if args.video else None
     summary, events, telemetry = run_episode(
         Adapter(make_env(args.seed, args.spawn_steps)), {'heuristic': heuristic, 'clef': clef, 'tree': tree_clef}[args.policy],
         sim_cap_ms=args.sim_cap_s * 1000, wall_cap_s=args.sim_cap_s + 30,
@@ -619,7 +631,7 @@ def main():
         sim_cap_s=args.sim_cap_s, summary=summary, quality=quality(summary, telemetry),
         events=events, telemetry=telemetry), indent=1))
     if recording:
-        recording.save(target.with_suffix('.gif'))
+        recording.close()
     print(json.dumps(dict(policy=args.policy, seed=args.seed, spawn_steps=args.spawn_steps, **quality(summary, telemetry))), flush=True)
 
 

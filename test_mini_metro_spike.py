@@ -1,6 +1,9 @@
 """Regression tests for the isolated Mini Metro experiment (no inference calls)."""
 import copy
 import os
+import shutil
+import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -72,10 +75,41 @@ class SpikeTests(unittest.TestCase):
     def test_recording_clears_background_before_each_frame(self):
         recording = Recording('test')
         recording(self.adapter, [])
-        self.assertEqual(recording.frames[-1].convert('RGB').getpixel((5, 200)), (247, 245, 239))
+        self.assertEqual(tuple(recording.last.get_at((5, 300)))[:3], (247, 245, 239))
         recording.surface.fill((255, 0, 0))
         recording(self.adapter, [])
-        self.assertEqual(recording.frames[-1].convert('RGB').getpixel((5, 200)), (247, 245, 239))
+        self.assertEqual(tuple(recording.last.get_at((5, 300)))[:3], (247, 245, 239))
+
+    @unittest.skipUnless(shutil.which('ffprobe') and os.path.exists('/usr/bin/ffmpeg'), 'ffmpeg/ffprobe missing')
+    def test_video_is_30fps_and_recording_does_not_change_sim_or_decisions(self):
+        def episode(video):
+            env = MiniMetroEnv(dt_ms=16)
+            env.reset(seed=42)
+            clock = [0.0]
+            def sleep(seconds):
+                clock[0] += seconds
+                time.sleep(0.0001)
+            rec = Recording('t', video) if video else None
+            summary, events, telemetry = run_episode(
+                Adapter(env), heuristic, sim_cap_ms=6000, wall_cap_s=15,
+                clock=lambda: clock[0], sleep=sleep, record=rec)
+            if rec:
+                rec.close()
+            keys = ('status', 'snapshot_sim_ms', 'apply_sim_ms', 'choice', 'simulated_age_ms')
+            return (env.mediator.time_ms, env.mediator.steps, env.mediator.deliveries,
+                    [{k: e.get(k) for k in keys} for e in events], telemetry)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'out.mp4'
+            self.assertEqual(episode(path), episode(None))
+            info = subprocess.check_output(
+                ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-count_frames',
+                 '-show_entries', 'stream=codec_name,pix_fmt,width,height,r_frame_rate,nb_read_frames',
+                 '-of', 'default=nw=1', str(path)], text=True)
+            facts = dict(line.split('=') for line in info.split())
+            self.assertEqual((facts['codec_name'], facts['pix_fmt'], facts['width'], facts['height'], facts['r_frame_rate']),
+                             ('h264', 'yuv420p', '960', '540', '30/1'))
+            self.assertAlmostEqual(int(facts['nb_read_frames']), 6 * 30 + 1, delta=2)  # 6 sim s at 30 fps
+            self.assertTrue(path.with_suffix('.png').exists())
 
     def test_spawn_pressure_changes_demand_and_stays_seed_deterministic(self):
         def spawned(steps):
