@@ -300,56 +300,44 @@ def _scores(answers, names, kind, prefix=''):
 
 def tree_clef(snapshot, ask=post_systemone, clock=time.monotonic):
     """Clef walks a code-pruned tree: station urgency (observable facts), then fix type, then leaf.
-    Two requests at most; no hidden fallback: a malformed answer raises and the decision is rejected."""
+    All levels are asked in ONE request (two sequential requests measured ~2 s, too close to the 3 s
+    deadline); code then walks down using only the branch Clef chose. Malformed answers raise: no fallback."""
     start = clock()
     state, menu = snapshot['state'], snapshot['menu']
     tree = build_tree(menu, state)
     stations = {s['label']: s for s in state['stations']}
     candidates = [label for label, fixes in tree.items() if set(fixes) - {'wait'}]
-    trace = []
     if not candidates:
         return {'choice': 'noop', 'trace': ['no_options']}
-    if len(candidates) == 1:
-        station = candidates[0]
-    else:
-        lines_of = {label: [l['label'] for l in state['lines'] if label in l['stations']] for label in stations}
-        questions = {}
-        for label in candidates:
-            s = stations[label]
-            where = f"on {', '.join(lines_of[label])}" if lines_of[label] else 'on NO line yet'
-            questions[f'urgency_{label}'] = {'type': 'noul', 'instructions': (
-                f"Mini Metro: station {label} ({s['shape']}) has {s['waiting']} passengers waiting, oldest has waited "
-                f"{s['oldest_wait_ms'] / 1000:.0f} s of a {state['max_wait_ms'] / 1000:.0f} s limit, {where}. "
-                'Is this the station most urgent to help right now?')}
-        answers = _answers(ask(state, questions, timeout=max(0.3, DEADLINE_S - 0.1 - (clock() - start))))
-        scores = _scores(answers, candidates, 'noul', 'urgency_')
-        station = max(scores, key=scores.get)
-    trace.append(station)
+    lines_of = {label: [l['label'] for l in state['lines'] if label in l['stations']] for label in stations}
+    questions = {}
+    for label in candidates:
+        s, fixes = stations[label], tree[label]
+        where = f"on {', '.join(lines_of[label])}" if lines_of[label] else 'on NO line yet'
+        questions[f'urgency_{label}'] = {'type': 'noul', 'instructions': (
+            f"Mini Metro: station {label} ({s['shape']}) has {s['waiting']} passengers waiting, oldest has waited "
+            f"{s['oldest_wait_ms'] / 1000:.0f} s of a {state['max_wait_ms'] / 1000:.0f} s limit, {where}. "
+            'Is this the station most urgent to help right now?')}
+        questions[f'fix_{label}'] = {'type': 'choice', 'instructions': (
+            f'Which kind of fix helps station {label} most now? New lines need a locomotive added afterwards.'),
+            'criteria': {f: FIXES[f] for f in fixes}}
+        for fix, leaves in fixes.items():
+            if len(leaves) > 1:
+                questions[f'leaf_{label}_{fix}'] = {'type': 'choice', 'instructions': f'Pick the concrete {fix} for station {label}.',
+                                                    'criteria': {leaf: leaf for leaf in leaves}}
+    answers = _answers(ask(state, questions, timeout=max(0.3, DEADLINE_S - 0.1 - (clock() - start))))
+    scores = _scores(answers, candidates, 'noul', 'urgency_')
+    station = max(scores, key=scores.get)
     fixes = tree[station]
-    non_wait = [f for f in fixes if f != 'wait']
-    kinds = [f for f in fixes if f != 'wait' or non_wait]
-    questions = {'fix_type': {'type': 'choice', 'instructions': (
-        f'Station {station} was judged most urgent. Which kind of fix helps it most now? '
-        'New lines need a locomotive added afterwards.'), 'criteria': {f: FIXES[f] for f in kinds}}}
-    for fix in kinds:
-        if len(fixes[fix]) > 1:
-            questions[f'leaf_{fix}'] = {'type': 'choice', 'instructions': f'Pick the concrete {fix} for station {station}.',
-                                        'criteria': {leaf: leaf for leaf in fixes[fix]}}
-    if len(kinds) == 1 and not any(k.startswith('leaf_') for k in questions):
-        fix = kinds[0]
-    else:
-        answers = _answers(ask(state, questions, timeout=max(0.3, DEADLINE_S - 0.1 - (clock() - start))))
-        probs = _choice(answers, 'fix_type', kinds)
-        fix = max(probs, key=probs.get)
-    trace.append(fix)
+    probs = _choice(answers, f'fix_{station}', list(fixes))
+    fix = max(probs, key=probs.get)
     leaves = fixes[fix]
     if len(leaves) == 1:
         leaf = leaves[0]
     else:
-        probs = _choice(answers, f'leaf_{fix}', leaves)
+        probs = _choice(answers, f'leaf_{station}_{fix}', leaves)
         leaf = max(probs, key=probs.get)
-    trace.append(leaf)
-    return {'choice': leaf, 'trace': trace}
+    return {'choice': leaf, 'trace': [station, fix, leaf]}
 
 
 def _answers(payload):
@@ -565,7 +553,7 @@ def summarize(root):
     mean = lambda xs: sum(xs) / len(xs) if xs else float('nan')
     for spawn in sorted({k[0] for k in runs}):
         print(f'\nspawn interval {spawn} steps')
-        for policy in ('heuristic', 'clef'):
+        for policy in ('heuristic', 'clef', 'tree'):
             rows = [v for k, v in runs.items() if k[:2] == (spawn, policy)]
             if not rows:
                 continue
@@ -579,12 +567,15 @@ def summarize(root):
                   f"survival_s={mean([x['survival_s'] for x in q]):.1f} deliveries={mean([x['deliveries'] for x in q]):.1f} "
                   f"per_min={mean([x['deliveries_per_min'] for x in q]):.1f} mean_wait={mean([x['mean_waiting'] for x in q]):.2f} "
                   f"unserved={mean([x['mean_unserved'] for x in q]):.2f} peak_wait_s={mean([x['peak_oldest_wait_s'] for x in q]):.1f}"
-                  + (f" latency_s med={sorted(lat)[len(lat)//2]:.2f} max={max(lat):.2f}" if lat and policy == 'clef' else '')
+                  + (f" latency_s med={sorted(lat)[len(lat)//2]:.2f} max={max(lat):.2f}" if lat and policy != 'heuristic' else '')
                   + f" statuses={ {k: v for k, v in st.items() if k != 'requested'} }")
-        seeds = sorted({k[2] for k in runs if k[0] == spawn and (spawn, 'clef', k[2]) in runs and (spawn, 'heuristic', k[2]) in runs})
-        for key in ('survival_s', 'deliveries'):
-            diffs = [runs[(spawn, 'clef', x)]['quality'][key] - runs[(spawn, 'heuristic', x)]['quality'][key] for x in seeds]
-            print(f"  paired clef-heuristic {key}: mean {mean(diffs):+.1f} wins {sum(d > 0 for d in diffs)} ties {sum(d == 0 for d in diffs)} losses {sum(d < 0 for d in diffs)} of {len(diffs)}")
+        for policy in ('clef', 'tree'):
+            seeds = sorted(x for (sp, pol, x) in runs if sp == spawn and pol == policy and (spawn, 'heuristic', x) in runs)
+            for key in ('survival_s', 'deliveries'):
+                diffs = [runs[(spawn, policy, x)]['quality'][key] - runs[(spawn, 'heuristic', x)]['quality'][key] for x in seeds]
+                if diffs:
+                    print(f"  paired {policy}-heuristic {key}: mean {mean(diffs):+.1f} wins {sum(d > 0 for d in diffs)} "
+                          f"ties {sum(d == 0 for d in diffs)} losses {sum(d < 0 for d in diffs)} of {len(diffs)}")
 
 
 def main():

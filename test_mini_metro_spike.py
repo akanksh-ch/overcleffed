@@ -277,21 +277,23 @@ class TreeTests(unittest.TestCase):
         tree = build_tree(snap['menu'], snap['state'])
         self.assertNotIn('add_train', tree['S0'])
 
-    def test_walk_picks_urgent_station_then_fix_then_leaf_in_two_requests(self):
+    def test_walk_picks_urgent_station_then_fix_then_leaf_in_one_request(self):
         snap = self.snap('create S0-S1', 'assign locomotive L0')
         calls = []
         def ask(state, questions, **kw):
-            calls.append(set(questions))
-            if len(calls) == 1:
-                return {'answers': {'urgency_S0': {'noul': 0.1}, 'urgency_S1': {'noul': 0.2}, 'urgency_S2': {'noul': 0.9}}}
-            return {'answers': {'fix_type': {'probabilities': {'extend': 0.7, 'wait': 0.3}},
-                    'leaf_extend': {'probabilities': {'extend L0 end to S2': 0.8, 'extend L0 start to S2': 0.2}}}}
+            calls.append(questions)
+            return {'answers': {
+                'urgency_S0': {'noul': 0.1}, 'urgency_S1': {'noul': 0.2}, 'urgency_S2': {'noul': 0.9},
+                'fix_S2': {'probabilities': {'extend': 0.7, 'wait': 0.3}},
+                'fix_S0': {'probabilities': {'wait': 1.0}},  # other stations' answers are ignored
+                'leaf_S2_extend': {'probabilities': {'extend L0 end to S2': 0.8, 'extend L0 start to S2': 0.2}}}}
         got = tree_clef(snap, ask=ask)
         self.assertEqual(got['choice'], 'extend L0 end to S2')
         self.assertEqual(got['trace'], ['S2', 'extend', 'extend L0 end to S2'])
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], {'urgency_S0', 'urgency_S1', 'urgency_S2'})
-        self.assertEqual(calls[1], {'fix_type', 'leaf_extend'})  # single-leaf types are never asked
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(set(calls[0]), {'urgency_S0', 'urgency_S1', 'urgency_S2', 'fix_S0', 'fix_S1', 'fix_S2',
+                                         'leaf_S2_extend'})  # single-leaf fix types get no leaf question
+        self.assertEqual(calls[0]['fix_S2']['criteria'].keys(), {'wait', 'extend'})
 
     def test_walk_makes_no_request_when_only_wait_remains(self):
         snap = self.adapter.snapshot()
@@ -306,9 +308,8 @@ class TreeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tree_clef(snap, ask=lambda state, questions, bad=bad, **kw: bad)
         def wrong_fix(state, questions, **kw):
-            if 'urgency_S0' in questions:
-                return {'answers': {'urgency_S0': {'noul': 1.0}, 'urgency_S1': {'noul': 0.0}, 'urgency_S2': {'noul': 0.0}}}
-            return {'answers': {'fix_type': {'probabilities': {'invented': 1.0}}}}
+            return {'answers': {'urgency_S0': {'noul': 1.0}, 'urgency_S1': {'noul': 0.0}, 'urgency_S2': {'noul': 0.0},
+                                'fix_S0': {'probabilities': {'invented': 1.0}}}}
         with self.assertRaises(ValueError):
             tree_clef(snap, ask=wrong_fix)
 
