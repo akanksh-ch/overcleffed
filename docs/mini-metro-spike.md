@@ -58,4 +58,56 @@ Existing project code exposes Clef `/v1/systemone` choice questions. A distinct 
 4. Give the model compact structured state and descriptions of the legal menu. Keep the heuristic separate: connect unserved stations to a nearby existing endpoint and allocate spare trains using an explicit queue-pressure rule. Do not attribute this heuristic to the adapter or model.
 5. Compare heuristic and model on the same small predeclared seed set and identical physics, action cadence, episode caps, and latency/deadline treatment. Decisions must remain active throughout; initial-network construction alone does not qualify. Log deliveries, waiting/overdue risk, game-over time, simulated/wall time, decision count, inference latency, errors, and stale/rejected actions. Report timeout behavior and fallback contributions separately.
 
-**Next recommendation:** approve this narrow continuous-control comparison only after identifying which Jev/Clef endpoint to use and agreeing on the concrete inference/time budget. No reason to begin training or evaluate untrusted PPO checkpoints for this hackathon spike.
+## Approved continuous-control implementation
+
+The user approved the existing **Clef** `/v1/systemone` endpoint, with no service/model-setting changes, seed 42, heuristic versus Clef, and per-run caps of 120 simulated seconds / 150 wall seconds. Physics ticks are 16 ms, with one decision opportunity every 5 simulated seconds, at most 24 requests, one in flight, and a 3-second acceptance deadline. HTTP uses a finite 2.5-second socket timeout. This is a Clef experiment, not a separately verified Jev API integration.
+
+`mini_metro_spike.py` contains the small standalone adapter, baseline, asynchronous request boundary, paced runner, and GIF export. `test_mini_metro_spike.py` exercises the real external simulator with delayed/error policies rather than real inference. It does not import kitchen code. Only detached state and the legal menu enter the inference worker; snapshot/episode checks and renewed current-state legal enumeration happen on the main thread. No policy fallback is used. Deadline expiration leaves the request in flight until its worker finishes; a second request is never started in the meantime. Actions replace a noop on the next ordinary physics tick, rather than adding zero-duration steps that would change spawn cadence.
+
+The restricted menu includes noop, every unordered two-station route, extension of either non-loop endpoint to any station not already on that route, locomotive assignment/unassignment, and carriage attachment/detachment. Fleet predicates reuse upstream legality queries. Route enumeration is Classic-only, with no destination/distance ranking or top-k selection. It deliberately omits arbitrary reroutes, route removal, loops, line purchasing, and upgrades. The heuristic is separate: start with a nearby unlike-shape pair, assign unserved lines a train, connect unserved stations at the nearest existing endpoint, and add capacity above an explicit queue-pressure threshold.
+
+### Reproduction
+
+Assuming the external checkout and environment recorded above:
+
+```sh
+/tmp/overcleffed-metro-venv/bin/python -m unittest -v test_mini_metro_spike
+# Existing localhost:8080 tunnel must already lead to the approved Clef service.
+timeout 310 /tmp/overcleffed-metro-venv/bin/python mini_metro_spike.py \\
+  --upstream /tmp/overcleffed-mini-metro-upstream \\
+  --output runs/mini_metro_seed42
+```
+
+The runner verifies upstream commit and tracked cleanliness, refuses an existing output directory, and saves manifest, per-policy summaries, decision events (including menu/state/probabilities/errors), sampled congestion telemetry, and a labeled GIF/final PNG. Artifacts are privileged structured-state visualizations, not pixel-model observations. Physics runs at real-time pace, catching up with unchanged 16 ms ticks after local overhead; final GIF encoding is outside the episode cap and separately timed. A request pending at episode end is logged and discarded, never joined or applied to another episode.
+
+Visual smoke inspection caught an important renderer usage detail: `GameRenderer.draw` does not clear the surface. The recorder now fills upstream `screen_color` before every frame, matching the upstream human loop; a regression test covers clearing. Preliminary `/tmp/metro-*.png` images and hashes above came from the original uncleared probe surface and should not be used as polished visual evidence.
+
+No reason to begin training or evaluate untrusted PPO checkpoints for this hackathon spike. Real comparison results follow once measured.
+
+## Measured results: seed 42, one run per policy
+
+Run 2026-10-25 via the reproduction command above (artifacts in ignored `runs/mini_metro_seed42/`: manifest, per-policy summary/events/telemetry, GIF, final PNG). Caps, cadence and deadline as approved; no service or model-setting changes. Clef is the existing `clef-flash` model on the existing localhost:8080 tunnel.
+
+| Policy | Deliveries | Sim end | Wall | Calls (accepted) | Waiting at end | Peak waiting | Peak oldest wait | Game over |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Heuristic | 30 | 120 s (cap) | 120.07 s | 24 (24) | 1 | 4 | 18.4 s | no |
+| Clef | 23 | 120 s (cap) | 120.07 s | 24 (24) | 5 | 6 | 31.1 s | no |
+
+No overdue passengers, game-over, late, deadline-expired, error, or upstream-rejected actions in either run. Clef latency: median 0.86 s, max 0.98 s; accepted actions applied up to 1.008 simulated seconds after their snapshot (heuristic: 16 ms). Both runs ended at 4 stations with one line.
+
+Decision sequences (24 opportunities each):
+- Heuristic: create S0-S2, assign, extend to S1, noop x7, extend to S3, noop x4, assign, noop x7, assign.
+- Clef: noop (first opportunity wasted), create S0-S1, assign twice, extend to S2, attach/attach/detach/attach carriage, noops, extend to S3 at t~60 s, unassign, attach, noops, unassign, assign.
+
+## Interpretation and limits
+
+- Single seed, single run each, one model. This is a smoke comparison, not a benchmark; 30 vs 23 deliveries is not evidence of a general ranking. No statistical claim.
+- Clef was usable on the continuous loop: every call answered inside the 3 s deadline, none stale-rejected, no fallback used. It kept managing (extend, fleet changes) through the episode, not only at start.
+- Clef trailed the heuristic here. Visible causes in the log: a wasted first opportunity, a later connection of the fourth station (S3 at ~60 s vs ~50 s), and fleet churn (carriage detach, locomotive unassign/assign). Reasons are inferred from logs, not tested.
+- Timing treatment is not equal in one respect: the heuristic answers in microseconds, Clef in ~0.86 s, so Clef acts on a staler snapshot. This is the realistic latency cost, but means the gap mixes decision quality and latency. A latency-matched heuristic (add 0.86 s delay) was not run.
+- Both runs ended on the 120 s cap, not game over; congestion pressure (peak oldest wait 18-31 s of the 40 s limit) never reached failure. A longer or denser episode could separate the policies more, but was outside the approved scope.
+- Assisted control only: structured state, atomic route/fleet operations, privileged-view GIF. Not pixel play, not human-equivalent. Clef only; no Jev interface tested.
+- Non-determinism: Clef responses and wall scheduling were not repeated; only upstream mechanics seed 42 is fixed.
+- Visual artifact checked by eye: Clef final frame shows a single orange line with carriages and one off-view/unconnected station state is not verified from the image; trust telemetry/events JSON over the GIF for metrics.
+
+Next options (not run, need approval): 3-5 more seeds each, latency-matched heuristic control, a tighter demand/longer cap so congestion actually bites, or stop and keep the kitchen demo as primary.
