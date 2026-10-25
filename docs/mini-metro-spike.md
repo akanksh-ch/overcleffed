@@ -119,3 +119,29 @@ Next options (not run, need approval): 3-5 more seeds each, latency-matched heur
 - Paired on seeds 1-5: Clef never beat the heuristic on survival (0 wins, 3 ties, 2 losses; mean -14.4 s) or deliveries (0 wins, 2 ties, 3 losses; mean -6.8).
 - Clef seeds 6-8 are incomplete (sweep killed for time); not rerun, excluded. Discarded: first Clef pass with 6 parallel runs had 21 `TimeoutError` on the 2.5 s socket timeout (shared endpoint load), moved to `runs/mini_metro_sweep/spawn900/_clef_parallel6_timeouts/`.
 - Stress levels beyond default spawn (denser demand) were not run. Game-overs came from Clef connecting stations late and churning fleet, per event logs; not isolated experimentally. n=5, one run each, no significance claim.
+
+## Decision-tree Clef (`tree`) vs choice-menu Clef vs heuristic: seeds 1-5, spawn 900, 120 s cap
+
+`tree` = `tree_clef` in `mini_metro_spike.py`. Code builds a legal-action tree (station -> fix type -> concrete leaf) and prunes churn (unassign/detach) and capacity fixes for stations with nobody waiting. One Clef request asks per-station urgency (`noul`), fix-type choice per station, and leaf choice where more than one leaf exists. Code walks only the branch Clef picked. Two sequential requests per decision (first version) timed out at ~2.9 s, so all levels go in one request (~1.2 s median). Malformed answers are rejected, no fallback. Same adapter, cadence, deadline and legality checks as the other policies.
+
+Cells: deliveries / outcome / peak oldest wait (limit 40 s; game over at second overdue passenger).
+
+| Seed | Heuristic | Clef choice menu | Clef tree |
+|---:|---|---|---|
+| 1 | 27 / ok / 23 s | 27 / ok / 39 s | 29 / ok / 40 s |
+| 2 | 33 / ok / 20 s | 33 / ok / 24 s | 33 / ok / 28 s |
+| 3 | 26 / ok / 25 s | 18 / game over at 116 s / 53 s | 25 / ok / 41 s |
+| 4 | 28 / ok / 22 s | 7 / game over at 52 s / 52 s | 27 / ok / 43 s |
+| 5 | 30 / ok / 18 s | 25 / ok / 33 s | 30 / ok / 26 s |
+| Mean | 28.8, 0 game overs | 22.0, 2 game overs | 28.8, 0 game overs |
+
+Tree vs heuristic paired (n=5): survival ties 5/5; deliveries 1 win, 2 ties, 2 losses, mean +0.0. Tree latency median 1.21 s, max 1.93 s, 120 accepted decisions, 0 errors or late actions. Mean waiting 2.84 (heuristic 1.95, choice-menu Clef 3.47); peak oldest wait 35.6 s (heuristic 21.2 s).
+
+Caveats:
+- n=5 seeds, one run per cell, no significance claim. Clef is nondeterministic: seed 4 choice-menu Clef game-overed at 52 s in the sweep run but survived (24-28 deliveries) in the 4 later re-recordings. Game overs for choice-menu Clef are real but not reliable per seed; the table cell is the sweep run.
+- Tree matches the heuristic on deliveries/survival but keeps higher waits (closer to the 40 s limit). It removes the choice-menu game overs in this sample; it does not beat the heuristic.
+- Pruning is code strategy, not model skill: part of the gain over the choice menu comes from code removing bad options (churn, pointless capacity fixes). Attribution between pruning and per-station questions was not isolated.
+- Seed 3 and 1 tree runs came from an aborted first loop (completed runs, kept). First two-request tree version (all 5 seeds mostly TimeoutError) archived under `_tree_v1_two_request_timeouts`, excluded. Choice-menu Clef seeds 6-8 incomplete, excluded.
+- Assisted structured control only; Clef only; privileged-state video.
+
+Demo video: `runs/mini_metro_side/spawn900/side-by-side-seed4.mp4` (1920x540, 30 fps, 120 s; left choice-menu Clef, right tree Clef, each panel shows live deliveries and waiting). In this recording choice-menu Clef did NOT game over (24 deliveries vs tree 27); the 52 s game over on seed 4 is in the sweep log, not the video. Three further Clef reruns on seed 4 (`runs/mini_metro_side_try*`) also survived (28, 28, 25 deliveries). Single-seed videos are illustration, not evidence.
