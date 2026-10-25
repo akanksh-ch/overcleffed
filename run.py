@@ -73,8 +73,9 @@ def run_episode(ep, args, policy, log, pool):
         # attach actions/reward to previous entry, then push new state
         hist.actions[-1], hist.rewards[-1] = tuple(names), r
         hist.push(ser)
-        if tick:
-            time.sleep(max(0, tick - (time.perf_counter() - t0)))
+        if tick or args.sim_hz:
+            period = tick or 1.0 / args.sim_hz
+            time.sleep(max(0, period - (time.perf_counter() - t0)))
     return {"ep": ep, "soups": soups, "reward": score, "steps": ser["t"], "late_or_failed": late,
             "mean_latency_s": statistics.mean(lats), "p95_latency_s": pct(lats, 0.95),
             "n_clef_calls": calls, "mean_input_tokens": statistics.mean(toks) if toks else None,
@@ -96,6 +97,8 @@ def main():
     ap.add_argument("--decode", choices=["argmax", "sample"], default="argmax")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--tick-hz", type=float, default=0, help="0 = lockstep; >0 = real-time, late -> stay")
+    ap.add_argument("--async-clef", action="store_true", help="experimental independent per-chef macro requests")
+    ap.add_argument("--sim-hz", type=float, default=0, help="pace simulation without timing out inference")
     ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--out", default="runs/run")
     ap.add_argument("--backend", choices=["clef", "mock", "greedy"], default="clef")
@@ -103,6 +106,8 @@ def main():
     ap.add_argument("--url", default="http://localhost:8080")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    if args.async_clef and (args.actions != "macro" or args.backend != "clef" or args.mock or args.tick_hz or args.sim_hz <= 0):
+        ap.error("--async-clef requires --actions macro --backend clef --sim-hz > 0 and no --tick-hz")
     if args.mock:
         args.backend = "mock"
     if args.history_k is None:
@@ -113,6 +118,11 @@ def main():
     else:
       policy = {"clef": lambda: ClefPolicy(args.url, args.decode, args.temperature),
               "mock": lambda: MockPolicy(args.seed), "greedy": GreedyPolicy}[args.backend]()
+    if args.async_clef:
+        from overcleffed.async_policy import AsyncMacroPolicy
+        policy = AsyncMacroPolicy([clef_chooser(args.url, args.decode, args.temperature, timeout=10,
+                                                question_mode=args.question_mode) for _ in range(2)],
+                                  args.history_k, args.roles)
     import os
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     summaries = []
@@ -121,6 +131,8 @@ def main():
             s = run_episode(ep, args, policy, log, pool)
             summaries.append(s)
             print(json.dumps(s), file=sys.stderr)
+    if args.async_clef:
+        policy.close()
     tot = {"args": vars(args), "episodes": summaries,
            "soups_total": sum(s["soups"] for s in summaries),
            "reward_total": sum(s["reward"] for s in summaries),
