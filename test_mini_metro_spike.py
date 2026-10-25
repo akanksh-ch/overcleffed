@@ -18,8 +18,8 @@ try:
 except ModuleNotFoundError as error:
     raise unittest.SkipTest(f"isolated simulator dependencies unavailable: {error}") from error
 
-from mini_metro_spike import (Adapter, Decisions, Recording, heuristic, make_env, parse_choice,
-                              quality, run_episode)
+from mini_metro_spike import (Adapter, Decisions, Recording, build_tree, heuristic, make_env,
+                              parse_choice, quality, run_episode, tree_clef)
 
 
 class SpikeTests(unittest.TestCase):
@@ -243,6 +243,74 @@ class SpikeTests(unittest.TestCase):
         self.assertTrue(any(e['status'] == 'call_cap' for e in events))
         self.assertEqual(summary['ending'], 'sim_cap')
         self.assertGreater(len(telemetry), 1)
+
+
+class TreeTests(unittest.TestCase):
+    def setUp(self):
+        env = MiniMetroEnv(dt_ms=16)
+        env.reset(seed=42)
+        self.adapter = Adapter(env)
+
+    def snap(self, *ops):
+        for op in ops:
+            self.adapter.tick(self.adapter.snapshot()['menu'][op])
+        for _ in range(1000):  # 16 s: every station has spawned passengers
+            self.adapter.tick(None)
+        return self.adapter.snapshot()
+
+    def test_tree_groups_legal_leaves_by_station_and_fix_and_prunes_churn(self):
+        snap = self.snap()
+        tree = build_tree(snap['menu'], snap['state'])
+        self.assertEqual(set(tree), {'S0', 'S1', 'S2'})
+        self.assertEqual(tree['S0']['connect'], ['create S0-S1', 'create S0-S2'])
+        self.assertEqual(tree['S0']['wait'], ['noop'])
+        snap = self.snap('create S0-S1', 'assign locomotive L0')
+        tree = build_tree(snap['menu'], snap['state'])
+        self.assertEqual(tree['S2']['extend'], ['extend L0 start to S2', 'extend L0 end to S2'])
+        self.assertEqual(tree['S0'].get('add_train'), ['assign locomotive L0'])
+        self.assertNotIn('unassign locomotive L0', sum((v for t in tree.values() for v in t.values()), []))
+        self.assertNotIn('detach carriage L0', sum((v for t in tree.values() for v in t.values()), []))
+
+    def test_tree_drops_capacity_fixes_for_station_with_nobody_waiting(self):
+        snap = self.adapter.snapshot()
+        snap['state']['stations'][0]['waiting'] = 0
+        tree = build_tree(snap['menu'], snap['state'])
+        self.assertNotIn('add_train', tree['S0'])
+
+    def test_walk_picks_urgent_station_then_fix_then_leaf_in_two_requests(self):
+        snap = self.snap('create S0-S1', 'assign locomotive L0')
+        calls = []
+        def ask(state, questions, **kw):
+            calls.append(set(questions))
+            if len(calls) == 1:
+                return {'answers': {'urgency_S0': {'noul': 0.1}, 'urgency_S1': {'noul': 0.2}, 'urgency_S2': {'noul': 0.9}}}
+            return {'answers': {'fix_type': {'probabilities': {'extend': 0.7, 'wait': 0.3}},
+                    'leaf_extend': {'probabilities': {'extend L0 end to S2': 0.8, 'extend L0 start to S2': 0.2}}}}
+        got = tree_clef(snap, ask=ask)
+        self.assertEqual(got['choice'], 'extend L0 end to S2')
+        self.assertEqual(got['trace'], ['S2', 'extend', 'extend L0 end to S2'])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], {'urgency_S0', 'urgency_S1', 'urgency_S2'})
+        self.assertEqual(calls[1], {'fix_type', 'leaf_extend'})  # single-leaf types are never asked
+
+    def test_walk_makes_no_request_when_only_wait_remains(self):
+        snap = self.adapter.snapshot()
+        snap['menu'] = {'noop': {'type': 'noop'}}
+        got = tree_clef(snap, ask=lambda *a: self.fail('no request expected'))
+        self.assertEqual(got['choice'], 'noop')
+
+    def test_walk_rejects_malformed_answers_without_fallback(self):
+        snap = self.snap()
+        for bad in ({}, {'answers': {}}, {'answers': {'urgency_S0': {'noul': float('nan')}, 'urgency_S1': {'noul': 0.1}, 'urgency_S2': {'noul': 0.1}}},
+                    {'answers': {'urgency_S0': {'noul': 0.0}, 'urgency_S1': {'noul': 0.0}, 'urgency_S2': {'noul': 0.0}}}):
+            with self.assertRaises(ValueError):
+                tree_clef(snap, ask=lambda state, questions, bad=bad, **kw: bad)
+        def wrong_fix(state, questions, **kw):
+            if 'urgency_S0' in questions:
+                return {'answers': {'urgency_S0': {'noul': 1.0}, 'urgency_S1': {'noul': 0.0}, 'urgency_S2': {'noul': 0.0}}}
+            return {'answers': {'fix_type': {'probabilities': {'invented': 1.0}}}}
+        with self.assertRaises(ValueError):
+            tree_clef(snap, ask=wrong_fix)
 
 
 if __name__ == '__main__':

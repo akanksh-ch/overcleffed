@@ -212,9 +212,9 @@ class Decisions:
         return action
 
 
-def parse_choice(payload, menu):
+def parse_choice(payload, menu, key='route_operation'):
     try:
-        probabilities = payload['answers']['route_operation']['probabilities']
+        probabilities = payload['answers'][key]['probabilities']
         if not isinstance(probabilities, dict) or not probabilities:
             raise ValueError('empty probabilities')
         for name, probability in probabilities.items():
@@ -240,16 +240,135 @@ def clef(snapshot):
     body = {'model': 'clef-flash', 'state': json.dumps(snapshot['state']),
             'questions': {'route_operation': {'type': 'choice', 'instructions': instructions,
                                               'criteria': {name: name for name in snapshot['menu']}}}}
+    payload = post_systemone(snapshot['state'], body['questions'])
+    return {'choice': parse_choice(payload, snapshot['menu']),
+            'probabilities': payload['answers']['route_operation']['probabilities']}
+
+
+def post_systemone(state, questions, timeout=2.5):
+    """One existing-Clef call; finite socket timeout, bounded response size."""
+    body = {'model': 'clef-flash', 'state': json.dumps(state), 'questions': questions}
     request = Request('http://127.0.0.1:8080/v1/systemone',
                       data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
-    # Finite socket timeout; the controller independently rejects at 3 seconds.
-    with urlopen(request, timeout=2.5) as response:
+    with urlopen(request, timeout=timeout) as response:
         raw = response.read(1024 * 1024 + 1)
     if len(raw) > 1024 * 1024:
         raise ValueError('oversized Clef response')
-    payload = json.loads(raw)
-    return {'choice': parse_choice(payload, snapshot['menu']),
-            'probabilities': payload['answers']['route_operation']['probabilities']}
+    return json.loads(raw)
+
+
+FIXES = {'connect': 'link this station to another with a new line', 'extend': 'extend an existing line to this station',
+         'add_train': 'add a locomotive to a line serving this station',
+         'add_carriage': 'add a carriage to a line serving this station',
+         'wait': 'change nothing now'}
+
+
+def build_tree(menu, state):
+    """{station: {fix: [leaf keys]}} from the legal menu. Code prunes: unassign/detach (churn) are
+    never offered, and capacity fixes need passengers waiting at that station."""
+    waiting = {s['label']: s['waiting'] for s in state['stations']}
+    on_line = {line['label']: line['stations'] for line in state['lines']}
+    tree = {label: {'wait': ['noop']} for label in waiting}
+    for key in menu:
+        words = key.split()
+        if key.startswith('create'):
+            targets, fix = [f'S{x[1:]}' for x in words[1].split('-')], 'connect'
+        elif key.startswith('extend'):
+            targets, fix = [words[-1]], 'extend'
+        elif key.startswith(('assign', 'attach')):
+            targets, fix = on_line[words[-1]], 'add_train' if key.startswith('assign') else 'add_carriage'
+        else:
+            continue
+        for label in targets:
+            if fix.startswith('add') and not waiting[label]:
+                continue
+            tree[label].setdefault(fix, []).append(key)
+    return tree
+
+
+def _scores(answers, names, kind, prefix=''):
+    out = {}
+    for name in names:
+        value = (answers.get(prefix + name) or {}).get(kind)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError(f'malformed {kind} answer for {prefix + name}')
+        out[name] = value
+    if sum(out.values()) <= 0:
+        raise ValueError('zero probability mass')
+    return out
+
+
+def tree_clef(snapshot, ask=post_systemone, clock=time.monotonic):
+    """Clef walks a code-pruned tree: station urgency (observable facts), then fix type, then leaf.
+    Two requests at most; no hidden fallback: a malformed answer raises and the decision is rejected."""
+    start = clock()
+    state, menu = snapshot['state'], snapshot['menu']
+    tree = build_tree(menu, state)
+    stations = {s['label']: s for s in state['stations']}
+    candidates = [label for label, fixes in tree.items() if set(fixes) - {'wait'}]
+    trace = []
+    if not candidates:
+        return {'choice': 'noop', 'trace': ['no_options']}
+    if len(candidates) == 1:
+        station = candidates[0]
+    else:
+        lines_of = {label: [l['label'] for l in state['lines'] if label in l['stations']] for label in stations}
+        questions = {}
+        for label in candidates:
+            s = stations[label]
+            where = f"on {', '.join(lines_of[label])}" if lines_of[label] else 'on NO line yet'
+            questions[f'urgency_{label}'] = {'type': 'noul', 'instructions': (
+                f"Mini Metro: station {label} ({s['shape']}) has {s['waiting']} passengers waiting, oldest has waited "
+                f"{s['oldest_wait_ms'] / 1000:.0f} s of a {state['max_wait_ms'] / 1000:.0f} s limit, {where}. "
+                'Is this the station most urgent to help right now?')}
+        answers = _answers(ask(state, questions, timeout=max(0.3, DEADLINE_S - 0.1 - (clock() - start))))
+        scores = _scores(answers, candidates, 'noul', 'urgency_')
+        station = max(scores, key=scores.get)
+    trace.append(station)
+    fixes = tree[station]
+    non_wait = [f for f in fixes if f != 'wait']
+    kinds = [f for f in fixes if f != 'wait' or non_wait]
+    questions = {'fix_type': {'type': 'choice', 'instructions': (
+        f'Station {station} was judged most urgent. Which kind of fix helps it most now? '
+        'New lines need a locomotive added afterwards.'), 'criteria': {f: FIXES[f] for f in kinds}}}
+    for fix in kinds:
+        if len(fixes[fix]) > 1:
+            questions[f'leaf_{fix}'] = {'type': 'choice', 'instructions': f'Pick the concrete {fix} for station {station}.',
+                                        'criteria': {leaf: leaf for leaf in fixes[fix]}}
+    if len(kinds) == 1 and not any(k.startswith('leaf_') for k in questions):
+        fix = kinds[0]
+    else:
+        answers = _answers(ask(state, questions, timeout=max(0.3, DEADLINE_S - 0.1 - (clock() - start))))
+        probs = _choice(answers, 'fix_type', kinds)
+        fix = max(probs, key=probs.get)
+    trace.append(fix)
+    leaves = fixes[fix]
+    if len(leaves) == 1:
+        leaf = leaves[0]
+    else:
+        probs = _choice(answers, f'leaf_{fix}', leaves)
+        leaf = max(probs, key=probs.get)
+    trace.append(leaf)
+    return {'choice': leaf, 'trace': trace}
+
+
+def _answers(payload):
+    answers = payload.get('answers') if isinstance(payload, dict) else None
+    if not isinstance(answers, dict):
+        raise ValueError('malformed Clef payload')
+    return answers
+
+
+def _choice(answers, key, names):
+    probs = (answers.get(key) or {}).get('probabilities')
+    if not isinstance(probs, dict) or not probs:
+        raise ValueError(f'malformed choice answer for {key}')
+    for name, p in probs.items():
+        if name not in names or type(p) not in (int, float) or not math.isfinite(p) or p < 0:
+            raise ValueError(f'invalid choice or probability in {key}')
+    if sum(probs.values()) <= 0:
+        raise ValueError('zero probability mass')
+    return probs
 
 
 def heuristic(snapshot):
@@ -473,7 +592,7 @@ def main():
     parser.add_argument('--upstream', type=Path, default=Path('/tmp/overcleffed-mini-metro-upstream'))
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--summarize', action='store_true', help='aggregate existing runs under --output')
-    parser.add_argument('--policy', choices=('heuristic', 'clef'))
+    parser.add_argument('--policy', choices=('heuristic', 'clef', 'tree'))
     parser.add_argument('--seed', type=int)
     parser.add_argument('--spawn-steps', type=int, default=900)
     parser.add_argument('--sim-cap-s', type=int, default=120)
@@ -497,7 +616,7 @@ def main():
         parser.error(f'{target} exists')
     recording = Recording(args.policy) if args.gif else None
     summary, events, telemetry = run_episode(
-        Adapter(make_env(args.seed, args.spawn_steps)), {'heuristic': heuristic, 'clef': clef}[args.policy],
+        Adapter(make_env(args.seed, args.spawn_steps)), {'heuristic': heuristic, 'clef': clef, 'tree': tree_clef}[args.policy],
         sim_cap_ms=args.sim_cap_s * 1000, wall_cap_s=args.sim_cap_s + 30,
         max_calls=args.sim_cap_s * 1000 // DECISION_MS, record=recording)
     manifest = dict(upstream_commit=commit, tick_ms=TICK_MS, decision_ms=DECISION_MS, deadline_s=DEADLINE_S,
