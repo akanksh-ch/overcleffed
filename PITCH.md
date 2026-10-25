@@ -32,9 +32,9 @@ Results at high pressure (spawn rate 900, 120 s, passengers delivered):
 | 2 | 33 | 33 | 33 |
 | 3 | 26 | 18, game over | 25 |
 | 4 | 28 | 7, game over | 27 |
-| 5 | 30 | 25 | see docs |
+| 5 | 30 | 25 | 30 |
 
-Clef alone collapsed on 2 of 5 seeds. Tree Clef had no game overs and matched the heuristic.
+Clef alone collapsed on 2 of 5 seeds. Tree Clef had no game overs and delivered 144 passengers in total vs the heuristic's 144.
 
 ## The insight
 
