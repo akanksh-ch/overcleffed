@@ -18,7 +18,8 @@ try:
 except ModuleNotFoundError as error:
     raise unittest.SkipTest(f"isolated simulator dependencies unavailable: {error}") from error
 
-from mini_metro_spike import Adapter, Decisions, Recording, heuristic, run_episode, parse_choice
+from mini_metro_spike import (Adapter, Decisions, Recording, heuristic, make_env, parse_choice,
+                              quality, run_episode)
 
 
 class SpikeTests(unittest.TestCase):
@@ -75,6 +76,33 @@ class SpikeTests(unittest.TestCase):
         recording.surface.fill((255, 0, 0))
         recording(self.adapter, [])
         self.assertEqual(recording.frames[-1].convert('RGB').getpixel((5, 200)), (247, 245, 239))
+
+    def test_spawn_pressure_changes_demand_and_stays_seed_deterministic(self):
+        def spawned(steps):
+            env = make_env(42, steps)
+            for _ in range(1875):  # 30 simulated seconds of noop
+                env.step(None)
+            return len(env.mediator.passengers)
+        base, dense = spawned(900), spawned(300)
+        self.assertEqual(spawned(300), dense)
+        self.assertGreaterEqual(dense, base + 6)
+        self.assertEqual(make_env(42, 300).mediator.passenger_spawning_interval_step, 300)
+
+    def test_unserved_stations_counts_stations_off_every_line(self):
+        from mini_metro_spike import metrics
+        self.assertEqual(metrics(self.adapter)['unserved'], 3)
+        self.adapter.tick(self.adapter.snapshot()['menu']['create S0-S1'])
+        self.assertEqual(metrics(self.adapter)['unserved'], 1)
+
+    def test_quality_summarises_hand_checked_telemetry(self):
+        rows = [dict(sim_ms=0, deliveries=0, waiting=2, unserved=3, oldest_wait_ms=0, overdue=0),
+                dict(sim_ms=1000, deliveries=0, waiting=4, unserved=1, oldest_wait_ms=3000, overdue=0),
+                dict(sim_ms=2000, deliveries=2, waiting=6, unserved=0, oldest_wait_ms=9000, overdue=1)]
+        got = quality(dict(sim_ms=2000, deliveries=2, game_over=True), rows)
+        self.assertEqual(got, dict(survival_s=2.0, game_over=True, deliveries=2,
+                                   deliveries_per_min=60.0, first_delivery_s=2.0,
+                                   mean_waiting=4.0, mean_unserved=4 / 3,
+                                   peak_oldest_wait_s=9.0, peak_overdue=1))
 
     def test_reset_prevents_old_adapter_from_touching_new_episode(self):
         self.env.reset(seed=42)

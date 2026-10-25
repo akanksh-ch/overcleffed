@@ -298,7 +298,9 @@ def metrics(adapter):
     adapter.check_owner()
     m = adapter.mediator
     waiting = [p for s in m.stations for p in s.passengers]
+    on_line = {id(s) for path in m.paths for s in path.stations}
     return dict(sim_ms=m.time_ms, deliveries=m.deliveries, stations=len(m.stations),
+                unserved=sum(id(s) not in on_line for s in m.stations),
                 waiting=len(waiting), onboard=sum(len(t.passengers) for t in m.metros),
                 oldest_wait_ms=max((p.wait_ms for p in waiting), default=0),
                 overdue=sum(p.wait_ms >= m.passenger_max_wait_time_ms for p in waiting),
@@ -374,6 +376,34 @@ def run_episode(adapter, choose, *, sim_cap_ms=120000, wall_cap_s=150, max_calls
     return summary, decisions.events, telemetry
 
 
+def make_env(seed, spawn_steps=900):
+    """Classic env; spawn_steps is steps between a station's passengers (900 = upstream default)."""
+    from env import MiniMetroEnv
+    env = MiniMetroEnv(dt_ms=TICK_MS)
+    env.reset(seed=seed)
+    m = env.mediator
+    m.passenger_spawning_interval_step = spawn_steps
+    # Upstream rolls each station's interval once at construction, so re-roll the initial stations.
+    m.station_spawn_interval_steps.clear()
+    m.station_steps_since_last_spawn.clear()
+    m.initialize_station_spawning_state(m.stations)
+    return env
+
+
+def quality(summary, telemetry):
+    """Decision-quality view of one episode from 1 Hz telemetry (not just deliveries)."""
+    n = len(telemetry)
+    seconds = summary['sim_ms'] / 1000
+    first = next((r['sim_ms'] / 1000 for r in telemetry if r['deliveries']), None)
+    return dict(survival_s=seconds, game_over=summary['game_over'], deliveries=summary['deliveries'],
+                deliveries_per_min=summary['deliveries'] / seconds * 60 if seconds else 0.0,
+                first_delivery_s=first,
+                mean_waiting=sum(r['waiting'] for r in telemetry) / n,
+                mean_unserved=sum(r['unserved'] for r in telemetry) / n,
+                peak_oldest_wait_s=max(r['oldest_wait_ms'] for r in telemetry) / 1000,
+                peak_overdue=max(r['overdue'] for r in telemetry))
+
+
 class Recording:
     """Small, privileged-state GIF, not a pixel-input policy recording."""
 
@@ -407,40 +437,80 @@ class Recording:
         self.frames[-1].save(path.with_suffix('.png'))
 
 
+def summarize(root):
+    """Print per-pressure, per-policy means and paired Clef-minus-heuristic seed differences."""
+    runs = {}
+    for f in sorted(Path(root).glob('spawn*/*-seed*.json')):
+        data = json.loads(f.read_text())
+        runs[(int(f.parent.name[5:]), f.name.split('-')[0], data['seed'])] = data
+    mean = lambda xs: sum(xs) / len(xs) if xs else float('nan')
+    for spawn in sorted({k[0] for k in runs}):
+        print(f'\nspawn interval {spawn} steps')
+        for policy in ('heuristic', 'clef'):
+            rows = [v for k, v in runs.items() if k[:2] == (spawn, policy)]
+            if not rows:
+                continue
+            q = [r['quality'] for r in rows]
+            lat = [x for r in rows for x in r['summary']['latency_s']]
+            st = {}
+            for r in rows:
+                for key, n in r['summary']['statuses'].items():
+                    st[key] = st.get(key, 0) + n
+            print(f"  {policy:9} n={len(rows)} game_over={sum(x['game_over'] for x in q)} "
+                  f"survival_s={mean([x['survival_s'] for x in q]):.1f} deliveries={mean([x['deliveries'] for x in q]):.1f} "
+                  f"per_min={mean([x['deliveries_per_min'] for x in q]):.1f} mean_wait={mean([x['mean_waiting'] for x in q]):.2f} "
+                  f"unserved={mean([x['mean_unserved'] for x in q]):.2f} peak_wait_s={mean([x['peak_oldest_wait_s'] for x in q]):.1f}"
+                  + (f" latency_s med={sorted(lat)[len(lat)//2]:.2f} max={max(lat):.2f}" if lat and policy == 'clef' else '')
+                  + f" statuses={ {k: v for k, v in st.items() if k != 'requested'} }")
+        seeds = sorted({k[2] for k in runs if k[0] == spawn and (spawn, 'clef', k[2]) in runs and (spawn, 'heuristic', k[2]) in runs})
+        for key in ('survival_s', 'deliveries'):
+            diffs = [runs[(spawn, 'clef', x)]['quality'][key] - runs[(spawn, 'heuristic', x)]['quality'][key] for x in seeds]
+            print(f"  paired clef-heuristic {key}: mean {mean(diffs):+.1f} wins {sum(d > 0 for d in diffs)} ties {sum(d == 0 for d in diffs)} losses {sum(d < 0 for d in diffs)} of {len(diffs)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--upstream', type=Path, default=Path('/tmp/overcleffed-mini-metro-upstream'))
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--summarize', action='store_true', help='aggregate existing runs under --output')
+    parser.add_argument('--policy', choices=('heuristic', 'clef'))
+    parser.add_argument('--seed', type=int)
+    parser.add_argument('--spawn-steps', type=int, default=900)
+    parser.add_argument('--sim-cap-s', type=int, default=120)
+    parser.add_argument('--gif', action='store_true')
     args = parser.parse_args()
+    if args.summarize:
+        return summarize(args.output)
+    if args.policy is None or args.seed is None:
+        parser.error('--policy and --seed are required')
     commit = subprocess.check_output(['git', '-C', str(args.upstream), 'rev-parse', 'HEAD'], timeout=5, text=True).strip()
     dirty = subprocess.check_output(['git', '-C', str(args.upstream), 'status', '--porcelain', '--untracked-files=no'], timeout=5, text=True)
     if commit != UPSTREAM_COMMIT or dirty:
         parser.error('upstream must be clean and at the recorded commit')
-    args.output.mkdir(parents=True, exist_ok=False)
     os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
     os.environ.setdefault('SDL_AUDIODRIVER', 'dummy')
     sys.path.insert(0, str(args.upstream.resolve() / 'src'))
-    from env import MiniMetroEnv
-    manifest = dict(upstream_commit=commit, seed=42, tick_ms=TICK_MS,
-                    decision_ms=DECISION_MS, deadline_s=DEADLINE_S, http_socket_timeout_s=2.5,
-                    sim_cap_ms=120000, wall_cap_s=150, max_calls=24, python=sys.version,
-                    assistance='structured state and restricted atomic route/fleet operations',
-                    model='clef-flash', endpoint='http://127.0.0.1:8080/v1/systemone')
-    (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2))
-    summaries = {}
-    for label, choose in [('heuristic', heuristic), ('clef', clef)]:
-        env = MiniMetroEnv(dt_ms=TICK_MS)
-        env.reset(seed=42)
-        recording = Recording(label)
-        print(f'Starting {label}: seed 42, fixed 16ms, 120s sim / 150s wall cap', flush=True)
-        summary, events, telemetry = run_episode(Adapter(env), choose, record=recording)
-        summaries[label] = summary
-        for name, data in [('summary', summary), ('events', events), ('telemetry', telemetry)]:
-            (args.output / f'{label}-{name}.json').write_text(json.dumps(data, indent=2))
-        export_start = time.monotonic()
-        recording.save(args.output / f'{label}.gif')
-        print(json.dumps(dict(policy=label, **summary, export_wall_s=time.monotonic()-export_start)), flush=True)
-    (args.output / 'comparison.json').write_text(json.dumps(summaries, indent=2))
+    out = args.output / f'spawn{args.spawn_steps}'
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / f'{args.policy}-seed{args.seed}.json'
+    if target.exists():
+        parser.error(f'{target} exists')
+    recording = Recording(args.policy) if args.gif else None
+    summary, events, telemetry = run_episode(
+        Adapter(make_env(args.seed, args.spawn_steps)), {'heuristic': heuristic, 'clef': clef}[args.policy],
+        sim_cap_ms=args.sim_cap_s * 1000, wall_cap_s=args.sim_cap_s + 30,
+        max_calls=args.sim_cap_s * 1000 // DECISION_MS, record=recording)
+    manifest = dict(upstream_commit=commit, tick_ms=TICK_MS, decision_ms=DECISION_MS, deadline_s=DEADLINE_S,
+                    http_socket_timeout_s=2.5, python=sys.version, model='clef-flash',
+                    endpoint='http://127.0.0.1:8080/v1/systemone',
+                    assistance='structured state and restricted atomic route/fleet operations')
+    target.write_text(json.dumps(dict(
+        manifest=manifest, policy=args.policy, seed=args.seed, spawn_steps=args.spawn_steps,
+        sim_cap_s=args.sim_cap_s, summary=summary, quality=quality(summary, telemetry),
+        events=events, telemetry=telemetry), indent=1))
+    if recording:
+        recording.save(target.with_suffix('.gif'))
+    print(json.dumps(dict(policy=args.policy, seed=args.seed, spawn_steps=args.spawn_steps, **quality(summary, telemetry))), flush=True)
 
 
 if __name__ == '__main__':
