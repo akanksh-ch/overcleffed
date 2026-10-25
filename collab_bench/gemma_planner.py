@@ -6,7 +6,7 @@ unchanged. Gemma output is typed, in the spirit of Jev/Clef decision APIs:
    lists stations that agent can reach, so unreachable goals cannot be written.
 2. Preconditions: code checks each goal against the state (for example "start" needs a loaded
    utensil, "wait" needs a working one). A failing goal is sent back with the error, up to
-   RETRIES times; if it still fails, that agent idles.
+   RETRIES times; failures retain valid unfinished work or use the deterministic planner.
 Gemma is called when the kitchen changes, or after STALL ticks without change.
 """
 import json
@@ -102,9 +102,36 @@ class GemmaPlanner(Planner):
         except (KeyError, TypeError, AttributeError) as e:  # model broke the schema
             return f"invalid goal {json.dumps(g)[:80]}: {e!r}"
 
+    def completed(self, i, g, state):
+        """Observe effects before checking the action's now-vanished preconditions."""
+        if not g:
+            return False
+        a, it, st = g['action'], g.get('item'), g.get('station')
+        held = state.players[i].held_object
+        held = held.name if held else None
+        ut = self.utensils(state).get(st, {})
+        if a in ('get_from_dispenser', 'take_from_counter', 'take_out'):
+            return held == it
+        if a == 'place_on_counter':
+            return held != it and self.locate(state, it) is not None
+        if a == 'put_into':
+            return held != it and (it in ut.get('contents', []) or ut.get('status') in ('cooking', 'ready'))
+        if a == 'start':
+            return ut.get('status') in ('cooking', 'ready')
+        if a == 'wait':
+            return ut.get('status') == 'ready'
+        if a == 'fill_dish':
+            return held == self.order
+        # Serving needs delivery evidence, not merely empty hands.
+        return False
+
     def _check(self, i, g, state):
         """Precondition check for agent i's typed goal. Returns an error string or None."""
-        a, it, st = g["action"], g.get("item"), g.get("station")
+        if not isinstance(g, dict) or not {'action', 'item', 'station'} <= g.keys():
+            return 'goal must contain action, item and station'
+        a, it, st = g['action'], g['item'], g['station']
+        if a not in ACTIONS[i] or it not in self._tree(self.order) | {'dish', None} or st not in STATIONS[i] + [None]:
+            return 'goal fields violate agent schema'
         held = state.players[i].held_object.name if state.players[i].held_object else None
         ut = self.utensils(state)
         counters = set(self.mdp.get_counter_locations())
@@ -159,9 +186,14 @@ class GemmaPlanner(Planner):
         return json.loads(r.json()["choices"][0]["message"]["content"])
 
     def goals(self, state):
+        retired = {}
+        for i, g in self.typed.items():
+            if g and (self.completed(i, g, state) or self.check(i, g, state)):
+                retired[i] = 'completed' if self.completed(i, g, state) else 'invalid'
+                self.typed[i], self.cached[i] = None, None
         snap = self.snapshot(state)
         sig = json.dumps(snap, sort_keys=True)
-        if sig == self.sig and state.timestep - self.since < STALL:
+        if not retired and sig == self.sig and state.timestep - self.since < STALL:
             return dict(self.cached)
         stalled = sig == self.sig
         self.sig, self.since = sig, state.timestep
@@ -176,8 +208,13 @@ class GemmaPlanner(Planner):
         for _ in range(RETRIES + 1):
             try:
                 raw = self.ask(base + feedback)
+                if (not isinstance(raw, dict) or not all(k in raw for k in ('chef', 'assistant'))
+                        or not isinstance(raw.get('reasoning'), str)):
+                    raise ValueError('response must contain reasoning, chef and assistant goals')
+
             except Exception as e:
                 errs.append(repr(e))
+                raw = None
                 break
             bad = {i: self.check(i, raw[k], state) for i, k in ((0, "chef"), (1, "assistant"))}
             if not any(bad.values()):
@@ -185,11 +222,24 @@ class GemmaPlanner(Planner):
             errs.append({k: bad[i] for i, k in ((0, "chef"), (1, "assistant")) if bad[i]})
             feedback = "\n\nYour last answer was rejected:\n" + "\n".join(
                 f"- {k} goal {json.dumps(raw[k])}: {bad[i]}" for i, k in ((0, "chef"), (1, "assistant")) if bad[i])
-        if raw is not None:
-            for i, k in ((0, "chef"), (1, "assistant")):
-                ok = self.check(i, raw[k], state) is None and raw[k]["action"] != "idle"
-                self.typed[i] = raw[k]
-                self.cached[i] = sentence(raw[k]) if ok else None
-        self.calls.append({"t": state.timestep, "latency_s": time.time() - t0, "raw": raw,
-                           "errors": errs, "goals": dict(self.cached), "err": errs[-1] if errs and raw is None else None})
+        fallback, sources, failed = None, {}, False
+        for i, k in ((0, 'chef'), (1, 'assistant')):
+            g = raw.get(k) if isinstance(raw, dict) else None
+            if g is not None and self.check(i, g, state) is None:
+                self.typed[i] = g
+                self.cached[i] = sentence(g)
+                sources[i] = 'intentional_idle' if g['action'] == 'idle' else 'model'
+            else:
+                failed = True
+                if self.typed[i] is not None and self.typed[i]['action'] != 'idle':
+                    sources[i] = 'retained'
+                else:
+                    if fallback is None:
+                        fallback = super().goals(state)
+                    self.typed[i] = None
+                    self.cached[i] = fallback[i]
+                    sources[i] = 'fallback'
+        self.calls.append({'t': state.timestep, 'latency_s': time.time() - t0, 'raw': raw,
+                           'errors': errs, 'goals': dict(self.cached), 'sources': sources,
+                           'retired': retired, 'err': (errs[-1] if errs else 'invalid response') if failed else None})
         return dict(self.cached)
